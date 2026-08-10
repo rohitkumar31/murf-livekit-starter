@@ -224,6 +224,17 @@ backend/
 └── railway.toml           # Railway deploy config
 ```
 
+
+Saathi uses two domain tools:
+
+1. **Triage classifier** — hand-built rule-based logic matching symptoms 
+   against red-flag patterns + duration. Local logic, not a live medical feed.
+2. **Nearest facility lookup** — small local sample dataset (4 Bihar 
+   districts). Not a live government API. Unlisted districts get an honest 
+   fallback (nearest hospital / call 108) instead of a guess.
+
+
+
 ## Links
 
 - [Murf Falcon TTS Docs](https://murf.ai/api/docs/text-to-speech/streaming)
