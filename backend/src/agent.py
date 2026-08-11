@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from livekit import rtc
+from livekit import api, rtc
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -14,6 +14,7 @@ from livekit.agents import (
     RunContext,
     cli,
     function_tool,
+    get_job_context,
     inference,
     tokenize,
     room_io,
@@ -24,6 +25,11 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
+
+# ---------------------------------------------------------------------------
+# Day 6: outbound trunk config
+# ---------------------------------------------------------------------------
+OUTBOUND_TRUNK_ID = "ST_xxxxxxxx"  # get this via: lk sip outbound list
 
 # ---------------------------------------------------------------------------
 # Simple SQLite memory store for returning callers (Day 4)
@@ -161,6 +167,7 @@ TOOLS
 When a caller describes a specific symptom and roughly how long they've had it, call check_triage_level to classify urgency instead of guessing yourself - this keeps your advice consistent. Always mention, in your own natural words, that this is based on general triage guidance, not a live medical data source.
 When a caller needs to know where to physically go for care and has told you their district, call find_nearest_facility. If the tool has no facility for their district, do not invent one - tell them you don't have a specific listing for their area and advise the nearest government hospital or calling 108 for emergencies. Always be clear that this is from a small local list, not a live directory, if the caller asks or if it seems relevant.
 If either tool fails or is unavailable, say so out loud in a calm, natural way and fall back to general safe advice (see a doctor or go to the nearest hospital/PHC) - never stay silent and never make up data.
+If the caller wants to end the call, or opts out of future calls, call end_call.
 
 MEMORY
 Early in the conversation, after greeting the caller, ask for their name. Then call lookup_caller with that name to check if they are a returning caller.
@@ -181,10 +188,16 @@ GUARDRAILS
 - If asked something outside health information, politely redirect.
 - Escalation script: say you can't advise on this safely, and that they should see a doctor or visit the nearest PHC or hospital right away.
 
+OUTBOUND CALL OPENING
+If this call was placed BY YOU (an outbound follow-up call, not one the caller initiated), your very first turn must, within the first two sentences, state:
+1. Who is calling and why - e.g. "नमस्ते, मैं साथी बोल रही हूँ। पिछली बार आपने जो लक्षण बताए थे, उसका फॉलो-अप करने के लिए कॉल किया है।"
+2. How to opt out - e.g. "अगर आप ये कॉल्स नहीं चाहते, तो सिर्फ बोलिए 'रोक दीजिए', और मैं आगे कॉल नहीं करूँगी।"
+Only after this, continue with the actual follow-up. If the caller says stop / band karo / mat karo, acknowledge respectfully and call end_call. This rule does not apply to inbound calls - for those, use the normal greeting below.
+
 STYLE
 Speak in short sentences, under 20 words each. One idea per sentence. No bullet points, no brackets, no lists read aloud. Never read raw JSON or tool output aloud - always turn it into a natural spoken sentence. Pause naturally after asking a question. If the caller goes silent, gently check in. After two unclear or silent turns, close warmly.
 
-Begin every new conversation with this greeting: "नमस्ते! मैं साथी हूँ, आपकी हेल्थ से जुड़ी जानकारी के लिए। आपका नाम क्या है?" Then look the caller up by name. Your responses are concise and without complex formatting, emojis, or symbols."""
+For INBOUND calls, begin every new conversation with this greeting: "नमस्ते! मैं साथी हूँ, आपकी हेल्थ से जुड़ी जानकारी के लिए। आपका नाम क्या है?" Then look the caller up by name. Your responses are concise and without complex formatting, emojis, or symbols."""
 
 
 class Assistant(Agent):
@@ -293,6 +306,16 @@ class Assistant(Agent):
                 "call 108 in an emergency."
             )
 
+    @function_tool
+    async def end_call(self, context: RunContext):
+        """Call this when the caller wants to end the call, or opts out of future calls."""
+        logger.info("Ending call at caller's request")
+        job_ctx = get_job_context()
+        if job_ctx is None:
+            return
+        await context.session.generate_reply(instructions="Say a brief, warm goodbye in the caller's language.")
+        await job_ctx.delete_room()
+
 
 server = AgentServer()
 
@@ -310,6 +333,33 @@ async def my_agent(ctx: JobContext):
         "room": ctx.room.name,
     }
 
+    # -----------------------------------------------------------------
+    # Day 6: outbound call handling
+    # If job metadata has a phone_number, this is an outbound follow-up
+    # call - dial out via SIP before starting the session.
+    # -----------------------------------------------------------------
+    dial_info = json.loads(ctx.job.metadata) if ctx.job.metadata else {}
+    phone_number = dial_info.get("phone_number")
+    followup_context = dial_info.get("followup_context", "")
+    sip_participant_identity = phone_number
+
+    if phone_number is not None:
+        try:
+            await ctx.api.sip.create_sip_participant(
+                api.CreateSIPParticipantRequest(
+                    room_name=ctx.room.name,
+                    sip_trunk_id=OUTBOUND_TRUNK_ID,
+                    sip_call_to=phone_number,
+                    participant_identity=sip_participant_identity,
+                    wait_until_answered=True,
+                )
+            )
+            logger.info("outbound call answered")
+        except api.SipCallError as e:
+            logger.error(f"outbound call failed: {e.sip_status_code} {e.sip_status}")
+            ctx.shutdown()
+            return
+
     session = AgentSession(
         stt=deepgram.STT(model="nova-3", language="multi"),
         llm=google.LLM(
@@ -326,22 +376,42 @@ async def my_agent(ctx: JobContext):
         preemptive_generation=True,
     )
 
-    await session.start(
-        agent=Assistant(),
-        room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if params.participant.kind
-                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else noise_cancellation.BVC()
-                ),
+    room_options = room_io.RoomOptions(
+        audio_input=room_io.AudioInputOptions(
+            noise_cancellation=lambda params: (
+                noise_cancellation.BVCTelephony()
+                if params.participant.kind
+                == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                else noise_cancellation.BVC()
             ),
         ),
     )
 
-    await ctx.connect()
+    if phone_number is not None:
+        # Outbound: wait for the callee to actually join before starting the
+        # session, so the greeting doesn't play into dead air.
+        participant = await ctx.wait_for_participant(identity=sip_participant_identity)
+        await session.start(
+            agent=Assistant(),
+            room=ctx.room,
+            room_options=room_options,
+        )
+        await session.generate_reply(
+            instructions=(
+                "This is an outbound follow-up call you placed. "
+                f"Follow-up context: {followup_context}. "
+                "Deliver the compulsory opening (who's calling, why, and how to opt out) "
+                "in your first two sentences, then continue with the follow-up."
+            )
+        )
+    else:
+        # Inbound: existing behaviour unchanged - caller speaks first via greeting.
+        await session.start(
+            agent=Assistant(),
+            room=ctx.room,
+            room_options=room_options,
+        )
+        await ctx.connect()
 
 
 if __name__ == "__main__":
