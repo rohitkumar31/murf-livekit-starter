@@ -62,6 +62,16 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS calls (
+            call_id TEXT PRIMARY KEY,
+            outcome TEXT,
+            channel TEXT,
+            created_at TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -171,6 +181,16 @@ def send_to_discord(reference_id, caller_name, reason, summary, what_was_checked
         return False
 
 
+def record_call(call_id: str, outcome: str, channel: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO calls (call_id, outcome, channel, created_at) VALUES (?, ?, ?, ?)",
+        (call_id, outcome, channel, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
 init_db()
 
 RED_FLAG_KEYWORDS = [
@@ -234,10 +254,10 @@ If either tool fails, say so out loud calmly and fall back to general safe advic
 
 ESCALATION TO A HUMAN
 There are exactly two situations where you must offer to escalate to a human:
-1. The caller describes a red-flag symptom (matches an emergency triage result, or clearly sounds like chest pain, breathing trouble, heavy bleeding, unconsciousness, sudden weakness, severe pain, suicidal thoughts, or a serious infant fever).
+1. The caller describes a red-flag symptom.
 2. The caller directly asks you to diagnose them or name what disease/condition they have.
-In either case: first tell the caller plainly that this is beyond what you can safely help with, and that you'd like to create a request for a human health worker to follow up. Explain what information you'd like to send (their name, a short summary of the symptom, what you already checked, how urgent it seems, their language, and how they'd like to be contacted back). Ask for their permission clearly. If they say no, do not create the request - simply give them the standard safety advice instead.
-If they agree, call create_escalation with a short, factual summary. Never include OTPs, PINs, passwords, or account numbers in the summary. After the tool call succeeds, tell the caller their reference ID clearly, and an honest next step.
+In either case: tell the caller plainly this is beyond what you can safely help with, explain what information you'd like to send, and ask permission clearly. If they say no, do not create the request - give standard safety advice instead.
+If they agree, call create_escalation with a short, factual summary. Never include OTPs, PINs, passwords, or account numbers. After success, tell the caller their reference ID and an honest next step.
 Do not escalate for ordinary health questions or clearly minor symptoms.
 
 MEMORY
@@ -265,6 +285,7 @@ Begin every new conversation with this greeting: "नमस्ते! मैं 
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
+        self.call_succeeded = False
 
     @function_tool
     async def lookup_caller(self, context: RunContext, caller_name: str):
@@ -306,6 +327,7 @@ class Assistant(Agent):
         """
         try:
             result = classify_triage(symptoms, duration_days)
+            self.call_succeeded = True
             return json.dumps(result, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Triage classification failed: {e}")
@@ -322,6 +344,7 @@ class Assistant(Agent):
             key = district.strip().lower()
             facility = PHC_DATASET.get(key)
             if facility:
+                self.call_succeeded = True
                 return f"Facility found: {facility['name']}, phone {facility['phone']}. Local sample list, not a live directory."
             return "NOT_FOUND: advise the nearest government hospital or calling 108."
         except Exception as e:
@@ -345,11 +368,11 @@ class Assistant(Agent):
 
         Args:
             caller_name: The caller's name.
-            reason: Short reason for escalation, e.g. "red-flag symptom" or "diagnosis request".
-            summary: A short, factual summary of what happened. Never include OTPs, PINs, passwords, or account numbers.
+            reason: Short reason for escalation.
+            summary: A short, factual summary. Never include OTPs, PINs, passwords, or account numbers.
             what_was_checked: What you (the agent) already checked or told the caller.
             urgency: One of "low", "medium", "high", "emergency".
-            language: The caller's language or mix, e.g. "Hindi", "Hindi-English mix".
+            language: The caller's language or mix.
             follow_up_method: How the caller prefers to be contacted back.
         """
         logger.info(f"Creating escalation for {caller_name}: {reason}")
@@ -357,11 +380,10 @@ class Assistant(Agent):
             reference_id = create_escalation_record(
                 caller_name, reason, summary, what_was_checked, urgency, language, follow_up_method
             )
-            sent = send_to_discord(
+            send_to_discord(
                 reference_id, caller_name, reason, summary, what_was_checked, urgency, language, follow_up_method
             )
-            if not sent:
-                logger.warning(f"Escalation {reference_id} saved locally but Discord send failed/skipped.")
+            self.call_succeeded = True
             return f"Escalation created successfully. Reference ID: {reference_id}"
         except Exception as e:
             logger.error(f"create_escalation failed: {e}")
@@ -400,8 +422,21 @@ async def my_agent(ctx: JobContext):
         preemptive_generation=True,
     )
 
+    assistant = Assistant()
+    call_id = f"{ctx.room.name}-{uuid.uuid4().hex[:6]}"
+
+    async def on_shutdown():
+        outcome = "success" if assistant.call_succeeded else "failed"
+        try:
+            record_call(call_id, outcome, "browser")
+            logger.info(f"Recorded call {call_id} as {outcome}")
+        except Exception as e:
+            logger.error(f"Failed to record call outcome: {e}")
+
+    ctx.add_shutdown_callback(on_shutdown)
+
     await session.start(
-        agent=Assistant(),
+        agent=assistant,
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -420,6 +455,3 @@ async def my_agent(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(server)
-
-
-    
