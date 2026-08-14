@@ -229,13 +229,13 @@ def classify_triage(symptoms: str, duration_days: float) -> dict:
 
 
 PHC_DATASET = {
-    "muzaffarpur": {"name": "Sadar Hospital, Muzaffarpur", "phone": "0621-2222083"},
-    "patna": {"name": "Patna Medical College Hospital (PMCH)", "phone": "0612-2300023"},
-    "vaishali": {"name": "Sadar Hospital, Hajipur, Vaishali", "phone": "06224-260204"},
-    "darbhanga": {"name": "Darbhanga Medical College Hospital (DMCH)", "phone": "06272-253335"},
+    "muzaffarpur": {"name": "Sadar Hospital, Muzaffarpur", "phone": "0621-2222083", "opd_hours": "9 AM - 2 PM, Mon-Sat", "walk_in": True},
+    "patna": {"name": "Patna Medical College Hospital (PMCH)", "phone": "0612-2300023", "opd_hours": "8 AM - 1 PM, Mon-Sat", "walk_in": True},
+    "vaishali": {"name": "Sadar Hospital, Hajipur, Vaishali", "phone": "06224-260204", "opd_hours": "9 AM - 2 PM, Mon-Sat", "walk_in": True},
+    "darbhanga": {"name": "Darbhanga Medical College Hospital (DMCH)", "phone": "06272-253335", "opd_hours": "8 AM - 1 PM, Mon-Sat", "walk_in": True},
 }
 
-SYSTEM_PROMPT = """IDENTITY
+MAIN_SYSTEM_PROMPT = """IDENTITY
 You are Saathi, a friendly voice assistant that helps people in rural and semi-urban India get basic health information and guidance. You are not a doctor and do not work for any hospital or pharmacy - you are an independent health information helper.
 
 OBJECTIVES
@@ -249,16 +249,17 @@ You know general, well-established public health information. You do NOT know th
 
 TOOLS
 When a caller describes a specific symptom and roughly how long they've had it, call check_triage_level to classify urgency instead of guessing yourself. Always mention this is based on general triage guidance, not a live medical data source.
-When a caller needs to know where to physically go for care and has told you their district, call find_nearest_facility. If not found, don't invent one - advise the nearest government hospital or calling 108.
-If either tool fails, say so out loud calmly and fall back to general safe advice - never stay silent, never make up data.
+If it fails, say so out loud calmly and fall back to general safe advice - never stay silent, never make up data.
+
+HANDOFF TO CLINIC & APPOINTMENT SPECIALIST
+You are a general health guidance assistant, not a booking or logistics assistant. If the caller asks specifically about which clinic/hospital to visit, opening hours, whether they need an appointment or can walk in, or how to reach a facility, do NOT try to answer this yourself - call transfer_to_clinic_specialist instead. Before transferring, tell the caller clearly and simply, e.g. "Main aapko hamare clinic specialist se connect karta hoon." Only transfer for clinic/appointment/visiting-logistics questions - not for triage, general health info, or escalation situations.
 
 ESCALATION TO A HUMAN
 There are exactly two situations where you must offer to escalate to a human:
 1. The caller describes a red-flag symptom.
 2. The caller directly asks you to diagnose them or name what disease/condition they have.
-In either case: tell the caller plainly this is beyond what you can safely help with, explain what information you'd like to send, and ask permission clearly. If they say no, do not create the request - give standard safety advice instead.
+Tell the caller plainly this is beyond what you can safely help with, explain what information you'd like to send, and ask permission clearly. If they say no, give standard safety advice instead.
 If they agree, call create_escalation with a short, factual summary. Never include OTPs, PINs, passwords, or account numbers. After success, tell the caller their reference ID and an honest next step.
-Do not escalate for ordinary health questions or clearly minor symptoms.
 
 MEMORY
 Early in the conversation, after greeting the caller, ask for their name. Then call lookup_caller with that name.
@@ -282,10 +283,64 @@ Speak in short sentences, under 20 words each. One idea per sentence. No bullet 
 Begin every new conversation with this greeting: "नमस्ते! मैं साथी हूँ, आपकी हेल्थ से जुड़ी जानकारी के लिए। आपका नाम क्या है?" Then look the caller up by name. Your responses are concise and without complex formatting, emojis, or symbols."""
 
 
+SPECIALIST_SYSTEM_PROMPT = """IDENTITY
+You are the Clinic & Appointment Specialist for Saathi. You have just taken over the conversation from Saathi, the general health assistant. You only handle one job: helping the caller figure out which facility to visit, its hours, and whether they need to book or can walk in.
+
+FIRST TURN
+Start by briefly introducing yourself, e.g. "नमस्ते, मैं क्लिनिक विशेषज्ञ हूँ। मैं आपको सही जगह और समय बताने में मदद करूँगा।" Do not make the caller repeat their question if they already told Saathi what they need - continue naturally from the conversation so far.
+
+KNOWLEDGE
+You know a small local list of government facilities with their OPD hours and whether walk-ins are accepted. This is a hand-built local sample list, not a live directory - mention this naturally if relevant.
+
+TOOLS
+Call find_facility_details when the caller has told you (or told Saathi) their district. If no match, say so honestly and suggest the nearest government hospital or calling 108 for emergencies - never invent a facility.
+
+LANGUAGE & SCRIPT
+Mirror the caller's language and mix. Hindi must be written in Devanagari, never romanized.
+
+LIMITS
+You do not give medical guidance, triage, or diagnoses - if the caller brings up a new symptom question, gently say that's outside what you handle and that Saathi can help with that. Keep answers short, spoken, and practical - hours, walk-in vs appointment, and how to reach the facility.
+
+STYLE
+Short sentences, under 20 words each. No bullet points, no brackets, no lists read aloud."""
+
+
+class ClinicSpecialist(Agent):
+    def __init__(self, main_agent_ref=None, caller_name: str = "") -> None:
+        super().__init__(instructions=SPECIALIST_SYSTEM_PROMPT)
+        self.main_agent_ref = main_agent_ref
+        self.caller_name = caller_name
+
+    @function_tool
+    async def find_facility_details(self, context: RunContext, district: str):
+        """Look up a facility's name, phone, OPD hours, and walk-in policy for a district.
+
+        Args:
+            district: The caller's district name, e.g. "Muzaffarpur".
+        """
+        try:
+            key = district.strip().lower()
+            facility = PHC_DATASET.get(key)
+            if facility:
+                if self.main_agent_ref:
+                    self.main_agent_ref.call_succeeded = True
+                walkin = "walk-ins are accepted" if facility["walk_in"] else "an appointment is needed"
+                return (
+                    f"{facility['name']}, phone {facility['phone']}. "
+                    f"OPD hours: {facility['opd_hours']}. {walkin}. "
+                    "This is from a small local sample list, not a live directory."
+                )
+            return "NOT_FOUND: advise the nearest government hospital or calling 108."
+        except Exception as e:
+            logger.error(f"Facility detail lookup failed: {e}")
+            return "TOOL_FAILED: advise the nearest government hospital or calling 108."
+
+
 class Assistant(Agent):
     def __init__(self) -> None:
-        super().__init__(instructions=SYSTEM_PROMPT)
+        super().__init__(instructions=MAIN_SYSTEM_PROMPT)
         self.call_succeeded = False
+        self.caller_name = ""
 
     @function_tool
     async def lookup_caller(self, context: RunContext, caller_name: str):
@@ -294,6 +349,7 @@ class Assistant(Agent):
         Args:
             caller_name: The name the caller gave you. Used as their identifier.
         """
+        self.caller_name = caller_name
         record = get_caller(caller_name)
         if record:
             return f"Returning caller found. Details: {json.dumps(record, ensure_ascii=False)}"
@@ -334,24 +390,6 @@ class Assistant(Agent):
             return "TOOL_FAILED: advise the caller to see a doctor or visit the nearest hospital/PHC to be safe."
 
     @function_tool
-    async def find_nearest_facility(self, context: RunContext, district: str):
-        """Look up the nearest known government health facility for a district.
-
-        Args:
-            district: The caller's district name, e.g. "Muzaffarpur".
-        """
-        try:
-            key = district.strip().lower()
-            facility = PHC_DATASET.get(key)
-            if facility:
-                self.call_succeeded = True
-                return f"Facility found: {facility['name']}, phone {facility['phone']}. Local sample list, not a live directory."
-            return "NOT_FOUND: advise the nearest government hospital or calling 108."
-        except Exception as e:
-            logger.error(f"Facility lookup failed: {e}")
-            return "TOOL_FAILED: advise the nearest government hospital or calling 108."
-
-    @function_tool
     async def create_escalation(
         self,
         context: RunContext,
@@ -388,6 +426,22 @@ class Assistant(Agent):
         except Exception as e:
             logger.error(f"create_escalation failed: {e}")
             return "TOOL_FAILED: tell the caller you couldn't create the request right now, and advise them to see a doctor or go to the nearest hospital/PHC directly."
+
+    @function_tool
+    async def transfer_to_clinic_specialist(self, context: RunContext, reason: str):
+        """Hand off the conversation to the Clinic & Appointment Specialist.
+
+        Call this ONLY when the caller asks which facility to visit, its opening
+        hours, whether they need an appointment or can walk in, or how to reach
+        it. Do not call this for triage, general health questions, or escalation
+        situations - those stay with you. Tell the caller you're connecting them
+        to the specialist before calling this.
+
+        Args:
+            reason: Brief reason for the handoff, e.g. "asked about clinic hours".
+        """
+        logger.info(f"Handing off to clinic specialist: {reason}")
+        return ClinicSpecialist(main_agent_ref=self, caller_name=self.caller_name)
 
 
 server = AgentServer()
